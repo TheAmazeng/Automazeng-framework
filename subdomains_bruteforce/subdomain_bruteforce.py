@@ -1,138 +1,137 @@
 import asyncio
 import aiodns
 import aiohttp
+import aiofiles
 import socket
 import os
-import subprocess  # For fast file line counting in Termux
-from tqdm.asyncio import tqdm
+import time
 
 class SubdomainBruteForce:
-    """Optimized Brute-force subdomain enumeration for Termux (low RAM usage & instant file writes)."""
+    """Handles Brute-force subdomain enumeration using a wordlist."""
 
-    def __init__(self, domain, wordlist_path, max_concurrent_tasks=5):
+    def __init__(self, domain, wordlist_path, max_concurrent_tasks=20):
         self.domain = domain
         self.wordlist_path = wordlist_path
         self.output_dns_only = f"output/{self.domain}_dns_only.txt"
         self.output_dns_and_http = f"output/{self.domain}_dns_and_http.txt"
+        self.found_dns_only = set()
+        self.found_dns_and_http = set()
         self.total_processed = 0
-        self.dns_queries = 0
-        self.http_queries = 0
-        self.max_concurrent_tasks = max_concurrent_tasks
-        self.lock = asyncio.Lock()  # ✅ Fix: Added missing lock
+        self.total_words = 0
+        self.start_time = time.time()
+        self.semaphore = asyncio.Semaphore(max_concurrent_tasks)
+
         os.makedirs("output", exist_ok=True)  # Ensure output directory exists
 
     async def initialize_resolver(self):
         """Initialize DNS resolver."""
-        loop = asyncio.get_event_loop()
-        self.resolver = aiodns.DNSResolver(loop=loop)
+        self.resolver = aiodns.DNSResolver(loop=asyncio.get_running_loop())
 
-    async def resolve_subdomain(self, subdomain):
-        """Resolve DNS for a subdomain with retries (ensuring counter correctness)."""
-        for _ in range(2):  # Reduce retries for lower processing time
+    async def resolve_subdomain(self, subdomain, retries=3):
+        """Resolve DNS for a subdomain with retries."""
+        for attempt in range(retries):
             try:
                 await self.resolver.gethostbyname(subdomain, socket.AF_INET)
-
-                async with self.lock:  # Ensure counter updates are atomic
-                    self.dns_queries += 1
-
-                return subdomain  # ✅ DNS resolution success!
+                return subdomain
             except (aiodns.error.DNSError, asyncio.TimeoutError):
-                await asyncio.sleep(0.5)  # Reduce delay to save time
-        return None  # ❌ DNS resolution failed
+                if attempt < retries - 1:
+                    await asyncio.sleep(1)
+        return None
 
-    async def check_http_live(self, subdomain):
-        """Check if the subdomain has an active HTTP server."""
-        async with aiohttp.ClientSession() as session:
+    async def check_http_live(self, subdomain, retries=3):
+        """Check if the subdomain has an active HTTP server with retries."""
+        for attempt in range(retries):
             try:
-                async with session.get(f"http://{subdomain}", timeout=4) as response:
-                    if response.status in [200, 301, 302]:  # ✅ HTTP is active!
-                        async with self.lock:
-                            self.http_queries += 1  # Safe counter increment
-                        return subdomain
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(f"http://{subdomain}", timeout=5) as response:
+                        if response.status in [200, 301, 302]:
+                            return subdomain
             except (aiohttp.ClientError, asyncio.TimeoutError):
-                return None  # ❌ No HTTP server
+                if attempt < retries - 1:
+                    await asyncio.sleep(1)
+        return None
 
-    async def process_subdomain(self, subdomain, progress_bar):
-        """Process a single subdomain: DNS check + HTTP check (counts from output files)."""
-        resolved_subdomain = await self.resolve_subdomain(subdomain)
-        if resolved_subdomain:
-            await self.save_to_file(self.output_dns_only, resolved_subdomain)  # ✅ Write immediately
+    async def process_subdomain(self, word):
+        """Process a single subdomain: DNS check + HTTP check."""
+        subdomain = f"{word}.{self.domain}"
 
-            live_http_subdomain = await self.check_http_live(resolved_subdomain)
-            if live_http_subdomain:
-                await self.save_to_file(self.output_dns_and_http, live_http_subdomain)  # ✅ Write immediately
+        async with self.semaphore:
+            resolved_subdomain = await self.resolve_subdomain(subdomain)
+            if resolved_subdomain:
+                self.found_dns_only.add(resolved_subdomain)
+                await self.save_to_file(self.output_dns_only, resolved_subdomain)
 
-        # Update counters every 10 subdomains (based on actual file contents)
-        if self.total_processed % 10 == 0:
-            self.dns_queries = self.count_lines(self.output_dns_only)
-            self.http_queries = self.count_lines(self.output_dns_and_http)
+                live_http_subdomain = await self.check_http_live(resolved_subdomain)
+                if live_http_subdomain:
+                    self.found_dns_and_http.add(live_http_subdomain)
+                    await self.save_to_file(self.output_dns_and_http, live_http_subdomain)
 
-        async with self.lock:  # Ensure safe update of progress tracking
             self.total_processed += 1
-            progress_bar.update(1)
-            progress_bar.set_postfix(dns=self.dns_queries, http=self.http_queries)
 
     async def run_bruteforce(self):
-        """Run the brute-force process efficiently (low RAM usage)."""
+        """Run the brute-force process with a wordlist."""
         await self.initialize_resolver()
 
         # Clear previous output files
         open(self.output_dns_only, 'w').close()
         open(self.output_dns_and_http, 'w').close()
 
+        # Load wordlist
         try:
             with open(self.wordlist_path, 'r') as f:
-                total_lines = sum(1 for _ in f)  # Get total line count
-                f.seek(0)  # Reset file pointer
-
-                with tqdm(total=total_lines, desc="Brute-forcing", ncols=80) as progress_bar:
-                    batch = []  # Minimize memory by using a batch
-                    for line in f:
-                        subdomain = f"{line.strip()}.{self.domain}"
-                        batch.append(subdomain)
-
-                        if len(batch) >= self.max_concurrent_tasks:  # Process small batches
-                            await asyncio.gather(*(self.process_subdomain(sub, progress_bar) for sub in batch))
-                            batch.clear()  # Free memory immediately
-
-                    if batch:  # Process remaining batch
-                        await asyncio.gather(*(self.process_subdomain(sub, progress_bar) for sub in batch))
-
+                words = [line.strip() for line in f.readlines()]
+                self.total_words = len(words)
         except Exception as e:
-            print(f"[ERROR] Failed to read wordlist: {e}")
+            print(f"[ERROR] Failed to load wordlist: {e}")
             return
 
-        print(f"\n✅ Scan complete! Results saved in the 'output/' folder.")
+        # Start brute force
+        last_update = time.time()
+        tasks = []
+        for word in words:
+            tasks.append(self.process_subdomain(word))
+            
+            # Run in batches to avoid memory overuse
+            if len(tasks) >= 20:
+                await asyncio.gather(*tasks)
+                tasks = []
+
+            # Print progress update every 5 minutes
+            if time.time() - last_update >= 300:
+                self.print_progress()
+                last_update = time.time()
+        
+        # Final batch
+        if tasks:
+            await asyncio.gather(*tasks)
+
+        self.print_progress(final=True)
+        print(f"\n✅ Scan complete! Found {len(self.found_dns_only)} DNS records and {len(self.found_dns_and_http)} active HTTP servers.")
+
+    def print_progress(self, final=False):
+        """Prints progress update every 5 minutes."""
+        elapsed_time = int(time.time() - self.start_time)
+        percentage = (self.total_processed / self.total_words) * 100 if self.total_words else 0
+        status = "Final Report:" if final else "Progress Update:"  
+        print(f"\n[{status}] {self.total_processed}/{self.total_words} ({percentage:.2f}%) completed | DNS: {len(self.found_dns_only)} | HTTP: {len(self.found_dns_and_http)} | Time: {elapsed_time}s")
 
     async def save_to_file(self, filename, data):
-        """Force write to disk without buffering issues."""
+        """Save a single subdomain to an output file asynchronously."""
         try:
-            async with self.lock:
-                print(f"[DEBUG] Writing to {filename}: {data}")  # 🔥 Debug log
-                with open(filename, 'a', encoding='utf-8') as f:
-                    f.write(f"{data}\n")
-                    f.flush()  # ✅ Force immediate disk write
-                    os.fsync(f.fileno())  # ✅ Ensure OS writes immediately
+            async with aiofiles.open(filename, 'a') as f:
+                await f.write(f"{data}\n")
         except Exception as e:
             print(f"[ERROR] Unable to save {data} to {filename}: {e}")
 
-    def count_lines(self, filename):
-        """Count the number of lines in a file (efficiently for Termux)."""
-        try:
-            result = subprocess.run(["wc", "-l", filename], capture_output=True, text=True)
-            return int(result.stdout.split()[0])  # Extract the line count
-        except Exception:
-            return 0  # Return 0 if there's an error (file missing, etc.)
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Subdomain Brute-force Tool (Optimized for Termux)")
+    parser = argparse.ArgumentParser(description="Subdomain Brute-force Tool")
     parser.add_argument("domain", help="Target domain for brute force")
     parser.add_argument("wordlist", help="Path to subdomain wordlist")
-    parser.add_argument("--batch", type=int, default=5, help="Batch size for concurrency (default: 5 for Termux)")
     args = parser.parse_args()
 
-    brute_forcer = SubdomainBruteForce(args.domain, args.wordlist, args.batch)
+    brute_forcer = SubdomainBruteForce(args.domain, args.wordlist)
     asyncio.run(brute_forcer.run_bruteforce())
 
 if __name__ == "__main__":
