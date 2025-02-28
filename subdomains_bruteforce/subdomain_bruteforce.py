@@ -1,7 +1,6 @@
 import asyncio
 import aiodns
 import aiohttp
-import aiofiles
 import socket
 import os
 from tqdm.asyncio import tqdm
@@ -19,7 +18,8 @@ class SubdomainBruteForce:
         self.total_processed = 0
         self.dns_queries = 0
         self.http_queries = 0
-        self.max_concurrent_tasks = max_concurrent_tasks  # Low concurrency for Termux
+        self.max_concurrent_tasks = max_concurrent_tasks
+        self.lock = asyncio.Lock()  # Lock for counter safety
         os.makedirs("output", exist_ok=True)  # Ensure output directory exists
 
     async def initialize_resolver(self):
@@ -31,24 +31,26 @@ class SubdomainBruteForce:
         """Resolve DNS for a subdomain with retries."""
         for _ in range(3):  # 3 retries
             try:
-                self.dns_queries += 1
+                async with self.lock:
+                    self.dns_queries += 1  # Safe counter increment
                 await self.resolver.gethostbyname(subdomain, socket.AF_INET)
                 return subdomain
             except (aiodns.error.DNSError, asyncio.TimeoutError):
-                await asyncio.sleep(1)  # Small delay before retry
-        return None
+                await asyncio.sleep(1)  # Retry delay
+        return None  # ❌ DNS resolution failed
 
     async def check_http_live(self, subdomain):
         """Check if the subdomain has an active HTTP server."""
         for _ in range(2):  # 2 retries
             try:
                 async with aiohttp.ClientSession() as session:
-                    self.http_queries += 1
                     async with session.get(f"http://{subdomain}", timeout=5) as response:
                         if response.status in [200, 301, 302]:
+                            async with self.lock:
+                                self.http_queries += 1  # Safe counter increment
                             return subdomain
             except (aiohttp.ClientError, asyncio.TimeoutError):
-                await asyncio.sleep(1)  # Avoid hammering servers
+                await asyncio.sleep(1)
         return None
 
     async def process_subdomain(self, subdomain, progress_bar):
@@ -56,14 +58,16 @@ class SubdomainBruteForce:
         resolved_subdomain = await self.resolve_subdomain(subdomain)
         if resolved_subdomain:
             self.found_dns_only.add(resolved_subdomain)
-            await self.save_to_file(self.output_dns_only, resolved_subdomain)
+            self.save_to_file(self.output_dns_only, resolved_subdomain)  # 🔥 Use synchronous writing
 
             live_http_subdomain = await self.check_http_live(resolved_subdomain)
             if live_http_subdomain:
                 self.found_dns_and_http.add(live_http_subdomain)
-                await self.save_to_file(self.output_dns_and_http, live_http_subdomain)
+                self.save_to_file(self.output_dns_and_http, live_http_subdomain)  # 🔥 Use synchronous writing
 
-        self.total_processed += 1
+        async with self.lock:
+            self.total_processed += 1  # Ensure safe increment
+
         progress_bar.update(1)
         progress_bar.set_postfix(dns=self.dns_queries, http=self.http_queries)
 
@@ -102,11 +106,11 @@ class SubdomainBruteForce:
 
         print(f"\n✅ Scan complete! Found {len(self.found_dns_only)} DNS records and {len(self.found_dns_and_http)} active HTTP servers.")
 
-    async def save_to_file(self, filename, data):
-        """Save a single subdomain to an output file asynchronously."""
+    def save_to_file(self, filename, data):
+        """Save a single subdomain to an output file (fixed for Termux)."""
         try:
-            async with aiofiles.open(filename, 'a') as f:
-                await f.write(f"{data}\n")
+            with open(filename, 'a') as f:  # 🔥 Use **synchronous** file writing
+                f.write(f"{data}\n")
         except Exception as e:
             print(f"[ERROR] Unable to save {data} to {filename}: {e}")
 
