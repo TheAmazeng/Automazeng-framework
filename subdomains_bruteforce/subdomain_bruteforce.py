@@ -7,7 +7,7 @@ import subprocess  # For fast file line counting in Termux
 from tqdm.asyncio import tqdm
 
 class SubdomainBruteForce:
-    """Optimized Brute-force subdomain enumeration for Termux (low RAM usage)."""
+    """Optimized Brute-force subdomain enumeration for Termux (low RAM usage & instant file writes)."""
 
     def __init__(self, domain, wordlist_path, max_concurrent_tasks=5):
         self.domain = domain
@@ -18,8 +18,8 @@ class SubdomainBruteForce:
         self.dns_queries = 0
         self.http_queries = 0
         self.max_concurrent_tasks = max_concurrent_tasks
-        self.lock = asyncio.Lock()  # ✅ Fix: Added missing lock
-        os.makedirs("output", exist_ok=True)  # Ensure output directory exists
+        self.lock = asyncio.Lock()  
+        os.makedirs("output", exist_ok=True)  
 
     async def initialize_resolver(self):
         """Initialize DNS resolver."""
@@ -28,39 +28,39 @@ class SubdomainBruteForce:
 
     async def resolve_subdomain(self, subdomain):
         """Resolve DNS for a subdomain with retries (ensuring counter correctness)."""
-        for _ in range(2):  # Reduce retries for lower processing time
+        for _ in range(2):  
             try:
                 await self.resolver.gethostbyname(subdomain, socket.AF_INET)
 
-                async with self.lock:  # Ensure counter updates are atomic
+                async with self.lock:  
                     self.dns_queries += 1
 
-                return subdomain  # ✅ DNS resolution success!
+                return subdomain  
             except (aiodns.error.DNSError, asyncio.TimeoutError):
                 await asyncio.sleep(0.5)  # Reduce delay to save time
-        return None  # ❌ DNS resolution failed
+        return None  
 
     async def check_http_live(self, subdomain):
         """Check if the subdomain has an active HTTP server."""
         async with aiohttp.ClientSession() as session:
             try:
                 async with session.get(f"http://{subdomain}", timeout=4) as response:
-                    if response.status in [200, 301, 302]:  # ✅ HTTP is active!
+                    if response.status in [200, 301, 302]:  
                         async with self.lock:
-                            self.http_queries += 1  # Safe counter increment
+                            self.http_queries += 1 
                         return subdomain
             except (aiohttp.ClientError, asyncio.TimeoutError):
-                return None  # ❌ No HTTP server
+                return None  
 
     async def process_subdomain(self, subdomain, progress_bar):
         """Process a single subdomain: DNS check + HTTP check (counts from output files)."""
         resolved_subdomain = await self.resolve_subdomain(subdomain)
         if resolved_subdomain:
-            self.save_to_file(self.output_dns_only, resolved_subdomain)  # ✅ Write immediately
+            await self.save_to_file(self.output_dns_only, resolved_subdomain)  
 
             live_http_subdomain = await self.check_http_live(resolved_subdomain)
             if live_http_subdomain:
-                self.save_to_file(self.output_dns_and_http, live_http_subdomain)  # ✅ Write immediately
+                await self.save_to_file(self.output_dns_and_http, live_http_subdomain)  
 
         # Update counters every 10 subdomains (based on actual file contents)
         if self.total_processed % 10 == 0:
@@ -104,12 +104,14 @@ class SubdomainBruteForce:
 
         print(f"\n✅ Scan complete! Results saved in the 'output/' folder.")
 
-    def save_to_file(self, filename, data):
-        """Save a single subdomain to an output file (optimized for Termux)."""
+    async def save_to_file(self, filename, data):
+        """Save a single subdomain to an output file asynchronously."""
         try:
-            with open(filename, 'a') as f:
-                f.write(f"{data}\n")
-                f.flush()  # ✅ Force immediate writing to disk (low RAM)
+            async with self.lock:  
+                with open(filename, 'a', buffering=1) as f:
+                    f.write(f"{data}\n")
+                    f.flush()  
+                    os.fsync(f.fileno())  
         except Exception as e:
             print(f"[ERROR] Unable to save {data}: {e}")
 
